@@ -1,0 +1,43 @@
+From f02bbca1b96fad0b3c61d10d65f92ee16f6bebb0 Mon Sep 17 00:00:00 2001
+From: oslab2 <oslab2@oslab2>
+Date: Tue, 17 Nov 2026 13:06:35 +0000
+Subject: [PATCH 5/5] pre-gso: allow Pre-GSO in init_net (native and microVM
+ guest)
+
+Remove the hard init_net exclusion. It was a safety gate against
+request/response stalls on host TCP (SSH, kubelet), which step 2 sleep
+flush now prevents. tcp_pre_gso_enabled still defaults to 0 in every
+netns including init_net, so host TCP is unaffected unless enabled
+there explicitly. This makes Pre-GSO usable natively and inside a Kata
+microVM guest, whose sockets live in the guest init_net.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ net/ipv4/tcp.c | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+index bbb43e44ea01..09cd9062998a 100644
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -1367,10 +1367,13 @@ static bool tcp_pre_gso_eligible(struct sock *sk,
+         atomic64_inc(&pre_gso_dyn_stat_oversize_bypass);
+         return false;
+     }
+-    /* Safety gate: never alter host-network TCP (SSH, kubelet, etc.).
+-     * Experiment can be enabled only inside an isolated netns, e.g. p1. */
+-    if (sock_net(sk) == &init_net)
+-        return false;
++    /* No init_net exclusion: Pre-GSO applies wherever it is enabled,
++     * i.e. native (host netns), container netns, or a microVM guest.
++     * tcp_pre_gso_enabled defaults to 0 in every netns, including
++     * init_net, so host TCP (SSH, kubelet, ...) is untouched unless the
++     * operator turns it on there.  The former hard gate guarded against
++     * request/response stalls, which sleep flush (step 2) now prevents.
++     */
+     if (sk->sk_state != TCP_ESTABLISHED && sk->sk_state != TCP_CLOSE_WAIT)
+         return false;
+     if (tp->repair || inet_sk(sk)->defer_connect)
+-- 
+2.34.1
+

@@ -1,0 +1,146 @@
+From 2413e5a1ad04bdc42cef306db747376f89ecaa9a Mon Sep 17 00:00:00 2001
+From: oslab2 <oslab2@oslab2>
+Date: Tue, 17 Nov 2026 09:20:28 +0000
+Subject: [PATCH 2/5] pre-gso: step 1 - Virtual Split correctness fixes
+
+- Timer handler: stop discarding staged bytes on sk_err alone. Staged
+  bytes now follow TCP write-queue rules: dropped only on TCP_CLOSE,
+  committed otherwise. Prevents a silent hole in the byte stream when
+  sk_err is set on a still-usable connection.
+- SEND_SHUTDOWN with staged bytes is an invariant violation (tcp_shutdown
+  commits before FIN): WARN_ON_ONCE and drop instead of queuing after FIN.
+- Commit staged bytes on explicit flush requests: TCP_CORK off and
+  TCP_NODELAY on.
+- Commit in do_tcp_sendpages() so in-kernel callers that bypass
+  tcp_sendpage_locked() cannot reorder data.
+- Treat MSG_CMSG_COMPAT as a plain flag so 32-bit sendmsg() callers are
+  eligible.
+- TCP_INFO tcpi_notsent_bytes includes staged bytes, matching SIOCOUTQNSD.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ net/ipv4/tcp.c | 55 +++++++++++++++++++++++++++++++++++++++++---------
+ 1 file changed, 46 insertions(+), 9 deletions(-)
+
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+index be1db3bf5ac9..546de2a2214c 100644
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -1061,6 +1061,13 @@ ssize_t do_tcp_sendpages(struct sock *sk, struct page *page, int offset,
+ 		      "page must not be a Slab one and have page_count > 0"))
+ 		return -EINVAL;
+ 
++	/* In-kernel users (tcp_bpf, nvme-tcp, iSCSI, ...) call this directly,
++	 * not through tcp_sendpage_locked(): older staged bytes must still
++	 * precede this payload in sequence space.
++	 */
++	if (tp->pre_gso_skb)
++		tcp_pre_gso_commit_locked(sk);
++
+ 	/* Wait for a connection to finish. One exception is TCP Fast Open
+ 	 * (passive side) where data is allowed to be sent before a connection
+ 	 * is fully established.
+@@ -1320,6 +1327,13 @@ static int __init tcp_pre_gso_dynamic_stats_init(void)
+ }
+ late_initcall(tcp_pre_gso_dynamic_stats_init);
+ 
++/* Per-call flags that do not change TCP send semantics.  MSG_CMSG_COMPAT
++ * is set by the kernel itself for every sendmsg() from a 32-bit process
++ * on a 64-bit kernel; it only selects the cmsg layout, and Pre-GSO
++ * already rejects any call carrying control data.
++ */
++#define TCP_PRE_GSO_PLAIN_FLAGS (MSG_DONTWAIT | MSG_NOSIGNAL | MSG_CMSG_COMPAT)
++
+ static bool tcp_pre_gso_eligible(struct sock *sk,
+                                  const struct msghdr *msg, size_t size,
+                                  u16 tsflags, int size_goal)
+@@ -1346,7 +1360,7 @@ static bool tcp_pre_gso_eligible(struct sock *sk,
+     if (tp->repair || inet_sk(sk)->defer_connect)
+         return false;
+     /* Reject all special per-call semantics except nonblocking/nosignal. */
+-    if (flags & ~(MSG_DONTWAIT | MSG_NOSIGNAL))
++    if (flags & ~TCP_PRE_GSO_PLAIN_FLAGS)
+         return false;
+     if (msg->msg_controllen || tsflags || (tp->nonagle & TCP_NAGLE_CORK))
+         return false;
+@@ -1614,16 +1628,29 @@ void tcp_pre_gso_timer_handler(struct sock *sk)
+     struct tcp_sock *tp = tcp_sk(sk);
+     u64 deadline = READ_ONCE(tp->pre_gso_deadline_ns);
+ 
+-    /* A peer RST / hard timeout may have closed the socket while the
+-     * hrtimer callback was deferred behind a user-owned socket.
+-     * Do not enqueue formerly accepted bytes into a closed TCP flow.
++    if (!tp->pre_gso_skb)
++        return;
++
++    /* Invariant: staged bytes share the fate of TCP write-queue bytes.
++     * TCP drops its write queue only when the connection is torn down
++     * (tcp_done / tcp_write_queue_purge / tcp_disconnect), never because
++     * sk_err is set on a still-usable connection.  Discarding here on
++     * sk_err alone would drop bytes already reported as sent while later
++     * bytes still go out, i.e. a silent hole in the byte stream.
++     */
++    if (sk->sk_state == TCP_CLOSE) {
++        tcp_pre_gso_discard_locked(sk);
++        return;
++    }
++    /* tcp_shutdown() commits before the FIN is queued, so staged bytes
++     * can never coexist with SEND_SHUTDOWN.  If they do, appending them
++     * after the FIN sequence would corrupt the stream: drop and report.
+      */
+-    if (tp->pre_gso_skb && (sk->sk_state == TCP_CLOSE || sk->sk_err ||
+-                            (sk->sk_shutdown & SEND_SHUTDOWN))) {
++    if (WARN_ON_ONCE(sk->sk_shutdown & SEND_SHUTDOWN)) {
+         tcp_pre_gso_discard_locked(sk);
+         return;
+     }
+-    if (tp->pre_gso_skb && deadline && ktime_get_ns() >= deadline) {
++    if (deadline && ktime_get_ns() >= deadline) {
+         atomic64_inc(&pre_gso_dyn_stat_timer);
+         tcp_pre_gso_commit_locked(sk);
+     }
+@@ -1662,7 +1689,7 @@ int tcp_sendmsg_locked(struct sock *sk, struct msghdr *msg, size_t size)
+ 
+ 	/* Older accepted bytes must precede exceptional send paths. */
+ 	if (tp->pre_gso_skb &&
+-	    ((flags & ~(MSG_DONTWAIT | MSG_NOSIGNAL)) ||
++	    ((flags & ~TCP_PRE_GSO_PLAIN_FLAGS) ||
+ 	     tp->repair || inet_sk(sk)->defer_connect ||
+ 	     (tp->nonagle & TCP_NAGLE_CORK) || inet_csk_has_ulp(sk)))
+ 		tcp_pre_gso_commit_locked(sk);
+@@ -3701,6 +3728,9 @@ static void __tcp_sock_set_cork(struct sock *sk, bool on)
+ 		tp->nonagle &= ~TCP_NAGLE_CORK;
+ 		if (tp->nonagle & TCP_NAGLE_OFF)
+ 			tp->nonagle |= TCP_NAGLE_PUSH;
++		/* Uncork is an explicit flush request: include staged bytes. */
++		if (tp->pre_gso_skb)
++			tcp_pre_gso_commit_locked(sk);
+ 		tcp_push_pending_frames(sk);
+ 	}
+ }
+@@ -3723,6 +3753,9 @@ static void __tcp_sock_set_nodelay(struct sock *sk, bool on)
+ {
+ 	if (on) {
+ 		tcp_sk(sk)->nonagle |= TCP_NAGLE_OFF|TCP_NAGLE_PUSH;
++		/* Setting TCP_NODELAY pushes queued data: include staged bytes. */
++		if (tcp_sk(sk)->pre_gso_skb)
++			tcp_pre_gso_commit_locked(sk);
+ 		tcp_push_pending_frames(sk);
+ 	} else {
+ 		tcp_sk(sk)->nonagle &= ~TCP_NAGLE_OFF;
+@@ -4285,7 +4318,11 @@ void tcp_get_info(struct sock *sk, struct tcp_info *info)
+ 
+ 	info->tcpi_bytes_acked = tp->bytes_acked;
+ 	info->tcpi_bytes_received = tp->bytes_received;
+-	info->tcpi_notsent_bytes = max_t(int, 0, tp->write_seq - tp->snd_nxt);
++	/* Staged Pre-GSO bytes are accepted but not yet sent, matching
++	 * SIOCOUTQNSD and tcp_stream_memory_free().
++	 */
++	info->tcpi_notsent_bytes = max_t(int, 0, tp->write_seq - tp->snd_nxt) +
++				   READ_ONCE(tp->pre_gso_bytes);
+ 	tcp_get_info_chrono_stats(tp, info);
+ 
+ 	info->tcpi_segs_out = tp->segs_out;
+-- 
+2.34.1
+

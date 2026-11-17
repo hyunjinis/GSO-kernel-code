@@ -1,0 +1,377 @@
+From a2c56e3abf17e86a3f862e7f68eeda42becc09df Mon Sep 17 00:00:00 2001
+From: oslab2 <oslab2@oslab2>
+Date: Tue, 17 Nov 2026 09:54:14 +0000
+Subject: [PATCH 4/5] pre-gso: step 3 - page-frag staging, exact memory
+ accounting, TCP_REPAIR
+
+Accumulator (paper Fig. 8 Message Accumulator) now stores data the same
+way tcp_sendmsg_locked() does, instead of one growing linear skb:
+
+- Headless staging skb; bytes copied into sk_page_frag() pages with
+  skb_copy_to_page_nocache(). Removes pskb_expand_head() re-copies,
+  per-batch high-order (order-3) allocations, and the extra copy that
+  skb_segment() made of linear data at software GSO.
+- Socket memory charged byte-for-byte by the standard helpers
+  (sk_wmem_schedule per chunk, then wmem_queued/forward_alloc charge),
+  fixing the schedule(growth) vs charge(truesize delta) mismatch.
+- Messages are accepted atomically: on -EFAULT, frag budget exhaustion
+  or memory shortage the skb is rolled back (frags, page refs, lengths,
+  charge) and the iov_iter rewound, so one send() is still exactly one
+  message and the Virtual Split return value stays exact.
+- Never wait for socket memory while holding staged bytes (they are
+  charged but not in flight): commit first, then wait.
+- Frag budget exhausted -> commit and retry (commit_grow_fail).
+- TCP_REPAIR on: commit staged bytes first so checkpoint tools that dump
+  the write queue (CRIU) do not lose them.
+- Empty (rolled-back) staging skbs are not counted as abandoned batches.
+- debugfs: skb_expand_* counters removed (path no longer exists).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ net/ipv4/tcp.c | 239 ++++++++++++++++++++++++++++++++-----------------
+ 1 file changed, 158 insertions(+), 81 deletions(-)
+
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+index 9356cadc3fc2..bbb43e44ea01 100644
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -1251,13 +1251,16 @@ static int tcp_sendmsg_fastopen(struct sock *sk, struct msghdr *msg,
+  * This file is inserted into net/ipv4/tcp.c before tcp_sendmsg_locked().
+  * DO NOT DEPLOY: see README.md, especially lifetime and sendmsg parity.
+  */
+-/* Dynamic staging is bounded by the actual GSO payload size.  A single
++/* Staging is bounded by the actual GSO payload size.  A single
+  * application write larger than this bound uses unmodified TCP, after
+  * committing any older pending bytes.  It is NOT counted as many messages.
+  * The cap is a safety ceiling, NOT an aggregation/virtual-message unit.
++ *
++ * Since step 3 the staging skb stores data in page fragments exactly like
++ * tcp_sendmsg_locked() (sk_page_frag + skb_copy_to_page_nocache): one copy
++ * from user space, no linear reallocation, no copy at software GSO, and
++ * socket memory charged byte-for-byte by the standard helpers.
+  */
+-#define TCP_PRE_GSO_INITIAL_BYTES 4096U
+-
+ static size_t tcp_pre_gso_batch_limit(const struct sock *sk)
+ {
+     unsigned int gso_max = READ_ONCE(sk->sk_gso_max_size);
+@@ -1271,7 +1274,10 @@ static size_t tcp_pre_gso_batch_limit(const struct sock *sk)
+ 
+ /* Research-only diagnostic counters: system-wide, not per netns.
+  * Compare deltas between adjacent debugfs reads during an isolated run.
+- * Approximate other commits = commits - N - timer - size - grow_fail.
++ * Approximate other commits = commits - N - timer - sleep - size -
++ * grow_fail - plug_overflow.  Since step 3, commit_grow_fail counts early
++ * commits made because the staging skb had no room (frag budget or
++ * socket memory) for the next message.
+  */
+ static atomic64_t pre_gso_dyn_stat_commits = ATOMIC64_INIT(0);
+ static atomic64_t pre_gso_dyn_stat_n = ATOMIC64_INIT(0);
+@@ -1285,8 +1291,6 @@ static atomic64_t pre_gso_dyn_stat_plug_overflow = ATOMIC64_INIT(0);
+ static atomic64_t pre_gso_dyn_stat_bytes = ATOMIC64_INIT(0);
+ static atomic64_t pre_gso_dyn_stat_messages = ATOMIC64_INIT(0);
+ static atomic64_t pre_gso_dyn_stat_accepted = ATOMIC64_INIT(0);
+-static atomic64_t pre_gso_dyn_stat_expand_calls = ATOMIC64_INIT(0);
+-static atomic64_t pre_gso_dyn_stat_expand_fail = ATOMIC64_INIT(0);
+ static atomic64_t pre_gso_dyn_stat_oversize_bypass = ATOMIC64_INIT(0);
+ /* Bytes accepted in the private staging skb but later abandoned by TCP.
+  * Not a measure of end-to-end delivery or application-visible data loss.
+@@ -1322,10 +1326,6 @@ static int tcp_pre_gso_dynamic_stats_show(struct seq_file *m, void *unused)
+         (unsigned long long)atomic64_read(&pre_gso_dyn_stat_messages));
+     seq_printf(m, "accepted_bytes %llu\n",
+         (unsigned long long)atomic64_read(&pre_gso_dyn_stat_accepted));
+-    seq_printf(m, "skb_expand_attempts %llu\n",
+-        (unsigned long long)atomic64_read(&pre_gso_dyn_stat_expand_calls));
+-    seq_printf(m, "skb_expand_fail %llu\n",
+-        (unsigned long long)atomic64_read(&pre_gso_dyn_stat_expand_fail));
+     seq_printf(m, "oversize_bypass %llu\n",
+         (unsigned long long)atomic64_read(&pre_gso_dyn_stat_oversize_bypass));
+     seq_printf(m, "abandoned_staging_bytes %llu\n",
+@@ -1403,8 +1403,11 @@ void tcp_pre_gso_discard_locked(struct sock *sk)
+     if (skb) {
+         int canceled;
+ 
+-        atomic64_inc(&pre_gso_dyn_stat_abandoned_batches);
+-        atomic64_add(skb->len, &pre_gso_dyn_stat_abandoned_bytes);
++        /* An empty staging skb (allocation rolled back) is not a batch. */
++        if (skb->len) {
++            atomic64_inc(&pre_gso_dyn_stat_abandoned_batches);
++            atomic64_add(skb->len, &pre_gso_dyn_stat_abandoned_bytes);
++        }
+         /* Cancellation with >0 transfers the armed timer's socket ref
+          * to us. With -1, the running callback owns that ref instead.
+          */
+@@ -1466,56 +1469,113 @@ static void tcp_pre_gso_commit_locked(struct sock *sk)
+ }
+ 
+ /*
+- * EXPERIMENTAL dynamic skb linear tail growth.
+- * Invariants: socket-memory accounting is updated by the actual truesize
+- * delta following expansion. This is not a production-audited replacement
+- * for the full TCP memory and skb lifecycle machinery.
++ * Page-frag staging.  One application message is accepted atomically:
++ * either all of its bytes are appended to the staging skb, or the skb is
++ * restored to its previous state (frags, lengths, socket memory charge)
++ * and the iterator is rewound.  This keeps "one send() == one message"
++ * and the Virtual Split return value exact even when a copy faults or
++ * memory runs out half-way through a message.
+  */
+-static int tcp_pre_gso_grow_staging(struct sock *sk,
+-                                   struct sk_buff *skb, size_t needed,
+-                                   size_t max_batch)
++struct tcp_pre_gso_snap {
++    unsigned int len;
++    int nr_frags;
++    unsigned int last_frag_size;
++};
++
++static void tcp_pre_gso_snap_take(const struct sk_buff *skb,
++                                  struct tcp_pre_gso_snap *snap)
+ {
+-    size_t available = skb_availroom(skb);
+-    size_t target, growth;
+-    unsigned int old_truesize;
+-    int ret;
++    const struct skb_shared_info *shi = skb_shinfo(skb);
+ 
+-    if (available >= needed)
+-        return 0;
+-    if ((size_t)skb->len + needed > max_batch)
+-        return -EMSGSIZE;
++    snap->len = skb->len;
++    snap->nr_frags = shi->nr_frags;
++    snap->last_frag_size = shi->nr_frags ?
++        skb_frag_size(&shi->frags[shi->nr_frags - 1]) : 0;
++}
++
++/* Undo appends made after @snap.  Mirrors skb_copy_to_page_nocache(),
++ * which charged len/data_len/truesize/wmem_queued/forward_alloc by the
++ * copied byte count, and skb_fill_page_desc(), which took a page ref.
++ */
++static void tcp_pre_gso_rollback(struct sock *sk, struct sk_buff *skb,
++                                 const struct tcp_pre_gso_snap *snap)
++{
++    struct skb_shared_info *shi = skb_shinfo(skb);
++    unsigned int delta = skb->len - snap->len;
++    int i;
++
++    for (i = snap->nr_frags; i < shi->nr_frags; i++)
++        skb_frag_unref(skb, i);
++    shi->nr_frags = snap->nr_frags;
++    if (snap->nr_frags)
++        skb_frag_size_set(&shi->frags[snap->nr_frags - 1],
++                          snap->last_frag_size);
++    if (!delta)
++        return;
++    skb->len -= delta;
++    skb->data_len -= delta;
++    skb->truesize -= delta;
++    sk_wmem_queued_add(sk, -(int)delta);
++    sk_mem_uncharge(sk, delta);
++}
+ 
+-    /* Geometric growth is an implementation detail, not a message boundary. */
+-    target = max_t(size_t, (size_t)skb->len + needed,
+-                   max_t(size_t, TCP_PRE_GSO_INITIAL_BYTES,
+-                         (size_t)skb->len + available) * 2);
+-    target = min(target, max_batch);
+-    growth = target - ((size_t)skb->len + available);
+-    if (!growth || growth > INT_MAX)
+-        return -ENOBUFS;
+-
+-    if (!sk_stream_memory_free(sk) || !sk_wmem_schedule(sk, growth))
+-        return -ENOBUFS;
+-
+-    old_truesize = skb->truesize;
+-    atomic64_inc(&pre_gso_dyn_stat_expand_calls);
+-    ret = pskb_expand_head(skb, 0, (int)growth, sk->sk_allocation);
+-    if (ret) {
+-        atomic64_inc(&pre_gso_dyn_stat_expand_fail);
+-        return ret;
++/* Copy @size bytes from @msg into page frags of @skb.  Same steps and
++ * accounting as the !zc branch of tcp_sendmsg_locked().  Returns 0, or
++ * -EFAULT (bad user buffer), -E2BIG (frag budget of this skb exhausted),
++ * -ENOBUFS (no page or no socket memory).  On error, nothing is appended
++ * and @msg's iterator is unchanged.
++ */
++static int tcp_pre_gso_copy_frags(struct sock *sk, struct sk_buff *skb,
++                                  struct msghdr *msg, size_t size)
++{
++    int max_frags = READ_ONCE(sysctl_max_skb_frags);
++    struct tcp_pre_gso_snap snap;
++    size_t left = size;
++    int err = 0;
++
++    tcp_pre_gso_snap_take(skb, &snap);
++    while (left) {
++        struct page_frag *pfrag = sk_page_frag(sk);
++        int i = skb_shinfo(skb)->nr_frags;
++        bool merge = true;
++        int copy;
++
++        if (!sk_page_frag_refill(sk, pfrag)) {
++            err = -ENOBUFS;
++            break;
++        }
++        if (!skb_can_coalesce(skb, i, pfrag->page, pfrag->offset)) {
++            if (i >= max_frags) {
++                err = -E2BIG;
++                break;
++            }
++            merge = false;
++        }
++        copy = min_t(size_t, left, pfrag->size - pfrag->offset);
++        if (!sk_wmem_schedule(sk, copy)) {
++            err = -ENOBUFS;
++            break;
++        }
++        /* Full-or-nothing: on -EFAULT the iterator is not advanced. */
++        err = skb_copy_to_page_nocache(sk, &msg->msg_iter, skb,
++                                       pfrag->page, pfrag->offset, copy);
++        if (err)
++            break;
++        if (merge) {
++            skb_frag_size_add(&skb_shinfo(skb)->frags[i - 1], copy);
++        } else {
++            skb_fill_page_desc(skb, i, pfrag->page, pfrag->offset, copy);
++            page_ref_inc(pfrag->page);
++        }
++        pfrag->offset += copy;
++        left -= copy;
+     }
+ 
+-    /* pskb_expand_head() has already mutated skb on success: never
+-     * return before reconciling its new accounting. TCP staging is
+-     * linear and normal expansion must not shrink true size.
+-     */
+-    if (WARN_ON_ONCE(skb->truesize < old_truesize))
+-        return -EIO;
+-    if (skb->truesize != old_truesize) {
+-        sk_wmem_queued_add(sk, skb->truesize - old_truesize);
+-        sk_mem_charge(sk, skb->truesize - old_truesize);
++    if (err) {
++        tcp_pre_gso_rollback(sk, skb, &snap);
++        iov_iter_revert(&msg->msg_iter, size - left);
+     }
+-    return (size_t)skb_availroom(skb) >= needed ? 0 : -ENOBUFS;
++    return err;
+ }
+ 
+ /* Each eligible application sendmsg() invocation counts as ONE logical
+@@ -1667,7 +1727,6 @@ static ssize_t tcp_pre_gso_append_locked(struct sock *sk,
+     struct tcp_sock *tp = tcp_sk(sk);
+     struct sk_buff *skb;
+     size_t max_batch = tcp_pre_gso_batch_limit(sk);
+-    size_t initial_bytes;
+     bool first_byte;
+     u32 timeout_us;
+     int err;
+@@ -1698,48 +1757,50 @@ static ssize_t tcp_pre_gso_append_locked(struct sock *sk,
+     if (!skb) {
+         if (!sk_stream_memory_free(sk))
+             goto wait_for_space;
+-        /* Predict a useful initial size from the N target and the actual
+-         * first write; avoid repeated reallocations for fixed-size streams.
+-         * Any later larger writes can still grow the staging buffer.
++        /* Headless skb, data goes to page frags: same as TCP's own
++         * new_segment allocation in tcp_sendmsg_locked().
+          */
+-        {
+-            size_t n = max_t(u32, 1, READ_ONCE(
+-                sock_net(sk)->ipv4.sysctl_tcp_pre_gso_n));
+-
+-            initial_bytes = min_t(size_t, max_batch,
+-                 size * min_t(size_t, n, max_batch / size));
+-            initial_bytes = max_t(size_t, initial_bytes,
+-                 min_t(size_t, TCP_PRE_GSO_INITIAL_BYTES, max_batch));
+-        }
+-        skb = sk_stream_alloc_skb(sk, initial_bytes, sk->sk_allocation,
+-                                  false);
++        skb = sk_stream_alloc_skb(sk, 0, sk->sk_allocation, false);
+         if (!skb)
+             goto wait_for_space;
+         skb->ip_summed = CHECKSUM_PARTIAL;
+         skb_shinfo(skb)->gso_size = 0;
+         tp->pre_gso_skb = skb;
++        /* Charged once here, never again at commit (see commit_locked). */
+         sk_wmem_queued_add(sk, skb->truesize);
+         sk_mem_charge(sk, skb->truesize);
+     }
+ 
+     first_byte = !skb->len;
+-    err = tcp_pre_gso_grow_staging(sk, skb, size, max_batch);
++    err = tcp_pre_gso_copy_frags(sk, skb, msg, size);
+     if (err) {
+-        if (skb->len) {
++        bool had_data = skb->len;
++
++        if (err == -EFAULT) {
++            /* Like TCP with nothing copied: report the fault; older
++             * staged bytes stay staged and keep their own triggers.
++             */
++            if (!had_data)
++                tcp_pre_gso_discard_locked(sk);
++            return err;
++        }
++        /* No room in this skb, or no memory: send what is staged (which
++         * also lets ACKs free memory), then retry the whole message.
++         */
++        if (had_data) {
+             atomic64_inc(&pre_gso_dyn_stat_grow_fail_commit);
+             tcp_pre_gso_commit_locked(sk);
+         } else {
+             tcp_pre_gso_discard_locked(sk);
++            /* A fresh skb has a full frag budget and size <= max_batch
++             * needs at most max_batch/PAGE_SIZE + 1 frags.
++             */
++            if (WARN_ON_ONCE(err == -E2BIG))
++                return -ENOBUFS;
+         }
+-        if (err == -ENOBUFS || err == -ENOMEM)
+-            goto wait_for_space;
+-        return err;
+-    }
+-    err = skb_add_data_nocache(sk, skb, &msg->msg_iter, size);
+-    if (err) {
+-        if (!skb->len)
+-            tcp_pre_gso_discard_locked(sk);
+-        return err;
++        if (err == -E2BIG)
++            goto retry;
++        goto wait_for_space;
+     }
+     atomic64_add(size, &pre_gso_dyn_stat_accepted);
+     WRITE_ONCE(tp->pre_gso_bytes, skb->len);
+@@ -1770,6 +1831,17 @@ static ssize_t tcp_pre_gso_append_locked(struct sock *sk,
+     return size;
+ 
+ wait_for_space:
++    /* Never sleep on socket memory while holding staged bytes: they are
++     * charged but not in flight, so no ACK could ever free them.
++     */
++    if (tp->pre_gso_skb) {
++        if (tp->pre_gso_skb->len) {
++            atomic64_inc(&pre_gso_dyn_stat_grow_fail_commit);
++            tcp_pre_gso_commit_locked(sk);
++        } else {
++            tcp_pre_gso_discard_locked(sk);
++        }
++    }
+     if (sk->sk_socket)
+         set_bit(SOCK_NOSPACE, &sk->sk_socket->flags);
+     err = sk_stream_wait_memory(sk, timeo);
+@@ -4143,6 +4215,11 @@ static int do_tcp_setsockopt(struct sock *sk, int level, int optname,
+ 		if (!tcp_can_repair_sock(sk))
+ 			err = -EPERM;
+ 		else if (val == TCP_REPAIR_ON) {
++			/* Checkpoint tools (CRIU) dump only the TCP write queue:
++			 * move staged Pre-GSO bytes there before repair begins.
++			 */
++			if (tp->pre_gso_skb)
++				tcp_pre_gso_commit_locked(sk);
+ 			tp->repair = 1;
+ 			sk->sk_reuse = SK_FORCE_REUSE;
+ 			tp->repair_queue = TCP_NO_QUEUE;
+-- 
+2.34.1
+

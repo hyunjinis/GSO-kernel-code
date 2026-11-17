@@ -1,0 +1,827 @@
+From 32bb7226a604fc9e58cab02f2f9b067288362fdb Mon Sep 17 00:00:00 2001
+From: oslab2 <oslab2@oslab2>
+Date: Tue, 17 Nov 2026 09:18:10 +0000
+Subject: [PATCH 1/5] Pre-GSO Dynamic v4 hardening (baseline, as running on
+ device)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/linux/tcp.h        |  11 +
+ include/net/netns/ipv4.h   |   3 +
+ include/net/tcp.h          |   3 +
+ net/ipv4/sysctl_net_ipv4.c |  24 ++
+ net/ipv4/tcp.c             | 507 ++++++++++++++++++++++++++++++++++++-
+ net/ipv4/tcp_ipv4.c        |  11 +-
+ net/ipv4/tcp_output.c      |   7 +-
+ net/ipv4/tcp_timer.c       |   1 +
+ 8 files changed, 556 insertions(+), 11 deletions(-)
+
+diff --git a/include/linux/tcp.h b/include/linux/tcp.h
+index a7ebadf83c68..f7ebf44f56e4 100644
+--- a/include/linux/tcp.h
++++ b/include/linux/tcp.h
+@@ -412,6 +412,15 @@ struct tcp_sock {
+ 	 */
+ 	struct request_sock __rcu *fastopen_rsk;
+ 	struct saved_syn *saved_syn;
++
++	/* Experimental independent Pre-GSO A-design accumulator. */
++	struct sk_buff *pre_gso_skb;
++	bool pre_gso_bypass;
++	u32 pre_gso_bytes;
++	u32 pre_gso_msgs;
++	u32 pre_gso_target_n;
++	u64 pre_gso_deadline_ns;
++	struct hrtimer pre_gso_timer;
+ };
+ 
+ enum tsq_enum {
+@@ -420,6 +429,7 @@ enum tsq_enum {
+ 	TCP_TSQ_DEFERRED,	   /* tcp_tasklet_func() found socket was owned */
+ 	TCP_WRITE_TIMER_DEFERRED,  /* tcp_write_timer() found socket was owned */
+ 	TCP_DELACK_TIMER_DEFERRED, /* tcp_delack_timer() found socket was owned */
++	TCP_PRE_GSO_TIMER_DEFERRED, /* Pre-GSO hrtimer found socket owned */
+ 	TCP_MTU_REDUCED_DEFERRED,  /* tcp_v{4|6}_err() could not call
+ 				    * tcp_v{4|6}_mtu_reduced()
+ 				    */
+@@ -432,6 +442,7 @@ enum tsq_flags {
+ 	TCPF_WRITE_TIMER_DEFERRED	= (1UL << TCP_WRITE_TIMER_DEFERRED),
+ 	TCPF_DELACK_TIMER_DEFERRED	= (1UL << TCP_DELACK_TIMER_DEFERRED),
+ 	TCPF_MTU_REDUCED_DEFERRED	= (1UL << TCP_MTU_REDUCED_DEFERRED),
++	TCPF_PRE_GSO_TIMER_DEFERRED = (1UL << TCP_PRE_GSO_TIMER_DEFERRED),
+ };
+ 
+ static inline struct tcp_sock *tcp_sk(const struct sock *sk)
+diff --git a/include/net/netns/ipv4.h b/include/net/netns/ipv4.h
+index d60a10cfc382..068d338c1ccc 100644
+--- a/include/net/netns/ipv4.h
++++ b/include/net/netns/ipv4.h
+@@ -133,6 +133,9 @@ struct netns_ipv4 {
+ 	u8 sysctl_tcp_tw_reuse;
+ 	int sysctl_tcp_fin_timeout;
+ 	unsigned int sysctl_tcp_notsent_lowat;
++	unsigned int sysctl_tcp_pre_gso_enabled;
++	unsigned int sysctl_tcp_pre_gso_n;
++	unsigned int sysctl_tcp_pre_gso_timeout_us;
+ 	u8 sysctl_tcp_sack;
+ 	u8 sysctl_tcp_window_scaling;
+ 	u8 sysctl_tcp_timestamps;
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index fdac6913b6c8..ed24a3d966d1 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -307,6 +307,9 @@ void tcp_tasklet_init(void);
+ int tcp_v4_err(struct sk_buff *skb, u32);
+ 
+ void tcp_shutdown(struct sock *sk, int how);
++void tcp_pre_gso_discard_locked(struct sock *sk);
++void tcp_pre_gso_timer_handler(struct sock *sk);
++void tcp_pre_gso_init_sock_state(struct sock *sk);
+ 
+ int tcp_v4_early_demux(struct sk_buff *skb);
+ int tcp_v4_rcv(struct sk_buff *skb);
+diff --git a/net/ipv4/sysctl_net_ipv4.c b/net/ipv4/sysctl_net_ipv4.c
+index 495c58e442e2..c787d88f668e 100644
+--- a/net/ipv4/sysctl_net_ipv4.c
++++ b/net/ipv4/sysctl_net_ipv4.c
+@@ -965,6 +965,30 @@ static struct ctl_table ipv4_net_table[] = {
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_douintvec,
+ 	},
++	{
++		.procname	= "tcp_pre_gso_enabled",
++		.data		= &init_net.ipv4.sysctl_tcp_pre_gso_enabled,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= proc_douintvec_minmax,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_ONE,
++	},
++	{
++		.procname	= "tcp_pre_gso_n",
++		.data		= &init_net.ipv4.sysctl_tcp_pre_gso_n,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= proc_douintvec_minmax,
++		.extra1		= SYSCTL_ONE,
++	},
++	{
++		.procname	= "tcp_pre_gso_timeout_us",
++		.data		= &init_net.ipv4.sysctl_tcp_pre_gso_timeout_us,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= proc_douintvec,
++	},
+ 	{
+ 		.procname	= "tcp_tw_reuse",
+ 		.data		= &init_net.ipv4.sysctl_tcp_tw_reuse,
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+index 51f34560a9d6..be1db3bf5ac9 100644
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -244,6 +244,9 @@
+ #define pr_fmt(fmt) "TCP: " fmt
+ 
+ #include <crypto/hash.h>
++#include <linux/debugfs.h>
++#include <linux/seq_file.h>
++#include <linux/atomic.h>
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/types.h>
+@@ -413,6 +416,25 @@ static u64 tcp_compute_delivery_rate(const struct tcp_sock *tp)
+  * NOTE: A lot of things set to zero explicitly by call to
+  *       sk_alloc() so need not be done here.
+  */
++static void tcp_pre_gso_commit_locked(struct sock *sk);
++static enum hrtimer_restart tcp_pre_gso_timer_callback(struct hrtimer *timer);
++
++/* Shared by active-open sockets AND accepted child sockets. */
++void tcp_pre_gso_init_sock_state(struct sock *sk)
++{
++	struct tcp_sock *tp = tcp_sk(sk);
++
++	tp->pre_gso_skb = NULL;
++	tp->pre_gso_msgs = 0;
++	tp->pre_gso_target_n = 0;
++	tp->pre_gso_bypass = false;
++	WRITE_ONCE(tp->pre_gso_bytes, 0);
++	WRITE_ONCE(tp->pre_gso_deadline_ns, 0);
++	hrtimer_init(&tp->pre_gso_timer, CLOCK_MONOTONIC,
++	             HRTIMER_MODE_ABS_PINNED_SOFT);
++	tp->pre_gso_timer.function = tcp_pre_gso_timer_callback;
++}
++
+ void tcp_init_sock(struct sock *sk)
+ {
+ 	struct inet_connection_sock *icsk = inet_csk(sk);
+@@ -625,7 +647,8 @@ int tcp_ioctl(struct sock *sk, int cmd, unsigned long arg)
+ 		if ((1 << sk->sk_state) & (TCPF_SYN_SENT | TCPF_SYN_RECV))
+ 			answ = 0;
+ 		else
+-			answ = READ_ONCE(tp->write_seq) - tp->snd_una;
++			answ = READ_ONCE(tp->write_seq) - tp->snd_una +
++				READ_ONCE(tp->pre_gso_bytes);
+ 		break;
+ 	case SIOCOUTQNSD:
+ 		if (sk->sk_state == TCP_LISTEN)
+@@ -635,7 +658,8 @@ int tcp_ioctl(struct sock *sk, int cmd, unsigned long arg)
+ 			answ = 0;
+ 		else
+ 			answ = READ_ONCE(tp->write_seq) -
+-			       READ_ONCE(tp->snd_nxt);
++			       READ_ONCE(tp->snd_nxt) +
++			       READ_ONCE(tp->pre_gso_bytes);
+ 		break;
+ 	default:
+ 		return -ENOIOCTLCMD;
+@@ -1121,8 +1145,18 @@ EXPORT_SYMBOL_GPL(do_tcp_sendpages);
+ int tcp_sendpage_locked(struct sock *sk, struct page *page, int offset,
+ 			size_t size, int flags)
+ {
+-	if (!(sk->sk_route_caps & NETIF_F_SG))
+-		return sock_no_sendpage_locked(sk, page, offset, size, flags);
++	/* Older pending bytes precede this sendpage payload. */
++	if (tcp_sk(sk)->pre_gso_skb)
++		tcp_pre_gso_commit_locked(sk);
++	if (!(sk->sk_route_caps & NETIF_F_SG)) {
++		int ret;
++
++		/* Fallback calls sendmsg: do not re-buffer sendpage data. */
++		tcp_sk(sk)->pre_gso_bypass = true;
++		ret = sock_no_sendpage_locked(sk, page, offset, size, flags);
++		tcp_sk(sk)->pre_gso_bypass = false;
++		return ret;
++	}
+ 
+ 	tcp_rate_check_app_limited(sk);  /* is sending application-limited? */
+ 
+@@ -1199,6 +1233,419 @@ static int tcp_sendmsg_fastopen(struct sock *sk, struct msghdr *msg,
+ 	return err;
+ }
+ 
++/*
++ * EXPERIMENTAL Linux v5.15 Pre-GSO A-design core (N + hrtimer).
++ * This file is inserted into net/ipv4/tcp.c before tcp_sendmsg_locked().
++ * DO NOT DEPLOY: see README.md, especially lifetime and sendmsg parity.
++ */
++/* Dynamic staging is bounded by the actual GSO payload size.  A single
++ * application write larger than this bound uses unmodified TCP, after
++ * committing any older pending bytes.  It is NOT counted as many messages.
++ * The cap is a safety ceiling, NOT an aggregation/virtual-message unit.
++ */
++#define TCP_PRE_GSO_INITIAL_BYTES 4096U
++
++static size_t tcp_pre_gso_batch_limit(const struct sock *sk)
++{
++    unsigned int gso_max = READ_ONCE(sk->sk_gso_max_size);
++
++    if (gso_max <= MAX_TCP_HEADER + 1)
++        return 0;
++    /* Do not exceed one legal GSO payload or the per-skb size budget. */
++    return min_t(size_t, (size_t)gso_max - 1 - MAX_TCP_HEADER,
++                 (size_t)60 * 1024);
++}
++
++/* Research-only diagnostic counters: system-wide, not per netns.
++ * Compare deltas between adjacent debugfs reads during an isolated run.
++ * Approximate other commits = commits - N - timer - size - grow_fail.
++ */
++static atomic64_t pre_gso_dyn_stat_commits = ATOMIC64_INIT(0);
++static atomic64_t pre_gso_dyn_stat_n = ATOMIC64_INIT(0);
++static atomic64_t pre_gso_dyn_stat_timer = ATOMIC64_INIT(0);
++static atomic64_t pre_gso_dyn_stat_size = ATOMIC64_INIT(0);
++static atomic64_t pre_gso_dyn_stat_grow_fail_commit = ATOMIC64_INIT(0);
++static atomic64_t pre_gso_dyn_stat_bytes = ATOMIC64_INIT(0);
++static atomic64_t pre_gso_dyn_stat_messages = ATOMIC64_INIT(0);
++static atomic64_t pre_gso_dyn_stat_accepted = ATOMIC64_INIT(0);
++static atomic64_t pre_gso_dyn_stat_expand_calls = ATOMIC64_INIT(0);
++static atomic64_t pre_gso_dyn_stat_expand_fail = ATOMIC64_INIT(0);
++static atomic64_t pre_gso_dyn_stat_oversize_bypass = ATOMIC64_INIT(0);
++/* Bytes accepted in the private staging skb but later abandoned by TCP.
++ * Not a measure of end-to-end delivery or application-visible data loss.
++ */
++static atomic64_t pre_gso_dyn_stat_abandoned_bytes = ATOMIC64_INIT(0);
++static atomic64_t pre_gso_dyn_stat_abandoned_batches = ATOMIC64_INIT(0);
++
++static int tcp_pre_gso_dynamic_stats_show(struct seq_file *m, void *unused)
++{
++    u64 commits = atomic64_read(&pre_gso_dyn_stat_commits);
++    u64 n = atomic64_read(&pre_gso_dyn_stat_n);
++    u64 timer = atomic64_read(&pre_gso_dyn_stat_timer);
++    u64 size = atomic64_read(&pre_gso_dyn_stat_size);
++    u64 grow_fail = atomic64_read(&pre_gso_dyn_stat_grow_fail_commit);
++
++    seq_printf(m, "commits %llu\n", (unsigned long long)commits);
++    seq_printf(m, "commit_n %llu\n", (unsigned long long)n);
++    seq_printf(m, "commit_timer %llu\n", (unsigned long long)timer);
++    seq_printf(m, "commit_size_limit %llu\n", (unsigned long long)size);
++    seq_printf(m, "commit_grow_fail %llu\n", (unsigned long long)grow_fail);
++    seq_printf(m, "commit_other_approx %lld\n",
++        (long long)commits-(long long)n-(long long)timer-
++        (long long)size-(long long)grow_fail);
++    seq_printf(m, "committed_bytes %llu\n",
++        (unsigned long long)atomic64_read(&pre_gso_dyn_stat_bytes));
++    seq_printf(m, "committed_messages %llu\n",
++        (unsigned long long)atomic64_read(&pre_gso_dyn_stat_messages));
++    seq_printf(m, "accepted_bytes %llu\n",
++        (unsigned long long)atomic64_read(&pre_gso_dyn_stat_accepted));
++    seq_printf(m, "skb_expand_attempts %llu\n",
++        (unsigned long long)atomic64_read(&pre_gso_dyn_stat_expand_calls));
++    seq_printf(m, "skb_expand_fail %llu\n",
++        (unsigned long long)atomic64_read(&pre_gso_dyn_stat_expand_fail));
++    seq_printf(m, "oversize_bypass %llu\n",
++        (unsigned long long)atomic64_read(&pre_gso_dyn_stat_oversize_bypass));
++    seq_printf(m, "abandoned_staging_bytes %llu\n",
++        (unsigned long long)atomic64_read(&pre_gso_dyn_stat_abandoned_bytes));
++    seq_printf(m, "abandoned_staging_batches %llu\n",
++        (unsigned long long)atomic64_read(&pre_gso_dyn_stat_abandoned_batches));
++    return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(tcp_pre_gso_dynamic_stats);
++static int __init tcp_pre_gso_dynamic_stats_init(void)
++{
++    debugfs_create_file("tcp_pre_gso_dynamic_stats", 0444, NULL, NULL,
++                        &tcp_pre_gso_dynamic_stats_fops);
++    return 0;
++}
++late_initcall(tcp_pre_gso_dynamic_stats_init);
++
++static bool tcp_pre_gso_eligible(struct sock *sk,
++                                 const struct msghdr *msg, size_t size,
++                                 u16 tsflags, int size_goal)
++{
++    const struct tcp_sock *tp = tcp_sk(sk);
++    int flags = msg->msg_flags;
++
++    /* A single application call is either accepted atomically into one
++     * pending skb, or sent by the unmodified TCP path.  This prevents
++     * counting one large send() as several N-batch messages. */
++    if (!size || !size_goal || tp->pre_gso_bypass ||
++        !sock_net(sk)->ipv4.sysctl_tcp_pre_gso_enabled)
++        return false;
++    if (size > tcp_pre_gso_batch_limit(sk)) {
++        atomic64_inc(&pre_gso_dyn_stat_oversize_bypass);
++        return false;
++    }
++    /* Safety gate: never alter host-network TCP (SSH, kubelet, etc.).
++     * Experiment can be enabled only inside an isolated netns, e.g. p1. */
++    if (sock_net(sk) == &init_net)
++        return false;
++    if (sk->sk_state != TCP_ESTABLISHED && sk->sk_state != TCP_CLOSE_WAIT)
++        return false;
++    if (tp->repair || inet_sk(sk)->defer_connect)
++        return false;
++    /* Reject all special per-call semantics except nonblocking/nosignal. */
++    if (flags & ~(MSG_DONTWAIT | MSG_NOSIGNAL))
++        return false;
++    if (msg->msg_controllen || tsflags || (tp->nonagle & TCP_NAGLE_CORK))
++        return false;
++    if (inet_csk_has_ulp(sk))
++        return false;
++    return true;
++}
++
++/*
++ * Invariant: a pending skb is owned and socket-memory-accounted exactly
++ * once, but is NOT present on TCP's write queue and has NO TCP sequence.
++ * Called under the TCP socket lock.
++ */
++void tcp_pre_gso_discard_locked(struct sock *sk)
++{
++    struct tcp_sock *tp = tcp_sk(sk);
++    struct sk_buff *skb = tp->pre_gso_skb;
++
++    tp->pre_gso_skb = NULL;
++    tp->pre_gso_msgs = 0;
++    tp->pre_gso_target_n = 0;
++    WRITE_ONCE(tp->pre_gso_bytes, 0);
++    WRITE_ONCE(tp->pre_gso_deadline_ns, 0);
++    if (skb) {
++        int canceled;
++
++        atomic64_inc(&pre_gso_dyn_stat_abandoned_batches);
++        atomic64_add(skb->len, &pre_gso_dyn_stat_abandoned_bytes);
++        /* Cancellation with >0 transfers the armed timer's socket ref
++         * to us. With -1, the running callback owns that ref instead.
++         */
++        canceled = hrtimer_try_to_cancel(&tp->pre_gso_timer);
++        if (canceled > 0)
++            sock_put(sk);
++        sk_wmem_free_skb(sk, skb);
++    }
++}
++
++/* Called under the TCP socket lock. No allocation or copying. */
++static void tcp_pre_gso_commit_locked(struct sock *sk)
++{
++    struct tcp_sock *tp = tcp_sk(sk);
++    struct sk_buff *skb = tp->pre_gso_skb;
++    struct tcp_skb_cb *tcb;
++    int size_goal, mss_now;
++
++    if (!skb)
++        return;
++    if (WARN_ON_ONCE(!skb->len)) {
++        tcp_pre_gso_discard_locked(sk);
++        return;
++    }
++
++    /* The timer holds one socket ref until canceled or callback completion. */
++    if (hrtimer_try_to_cancel(&tp->pre_gso_timer) > 0)
++        sock_put(sk);
++
++    atomic64_inc(&pre_gso_dyn_stat_commits);
++    atomic64_add(skb->len, &pre_gso_dyn_stat_bytes);
++    atomic64_add(tp->pre_gso_msgs, &pre_gso_dyn_stat_messages);
++    /* Transfer ownership: the skb cannot be in both queues. */
++    tp->pre_gso_skb = NULL;
++    tp->pre_gso_msgs = 0;
++    tp->pre_gso_target_n = 0;
++    WRITE_ONCE(tp->pre_gso_bytes, 0);
++    WRITE_ONCE(tp->pre_gso_deadline_ns, 0);
++
++    tcb = TCP_SKB_CB(skb);
++    memset(tcb, 0, sizeof(*tcb));
++    skb->csum = 0;
++    tcb->seq = tp->write_seq;
++    tcb->end_seq = tp->write_seq + skb->len;
++    tcb->tcp_flags = TCPHDR_ACK;
++    tcb->sacked = 0;
++    tcp_skb_pcount_set(skb, 0);
++    __skb_header_release(skb);
++    tcp_add_write_queue_tail(sk, skb);
++    WRITE_ONCE(tp->write_seq, tcb->end_seq);
++
++    /* Memory was already charged at acceptance, not here. */
++    if (tp->nonagle & TCP_NAGLE_PUSH)
++        tp->nonagle &= ~TCP_NAGLE_PUSH;
++    tcp_slow_start_after_idle_check(sk);
++
++    mss_now = tcp_send_mss(sk, &size_goal, 0);
++    tcp_push(sk, 0, mss_now, tp->nonagle, size_goal);
++}
++
++/*
++ * EXPERIMENTAL dynamic skb linear tail growth.
++ * Invariants: socket-memory accounting is updated by the actual truesize
++ * delta following expansion. This is not a production-audited replacement
++ * for the full TCP memory and skb lifecycle machinery.
++ */
++static int tcp_pre_gso_grow_staging(struct sock *sk,
++                                   struct sk_buff *skb, size_t needed,
++                                   size_t max_batch)
++{
++    size_t available = skb_availroom(skb);
++    size_t target, growth;
++    unsigned int old_truesize;
++    int ret;
++
++    if (available >= needed)
++        return 0;
++    if ((size_t)skb->len + needed > max_batch)
++        return -EMSGSIZE;
++
++    /* Geometric growth is an implementation detail, not a message boundary. */
++    target = max_t(size_t, (size_t)skb->len + needed,
++                   max_t(size_t, TCP_PRE_GSO_INITIAL_BYTES,
++                         (size_t)skb->len + available) * 2);
++    target = min(target, max_batch);
++    growth = target - ((size_t)skb->len + available);
++    if (!growth || growth > INT_MAX)
++        return -ENOBUFS;
++
++    if (!sk_stream_memory_free(sk) || !sk_wmem_schedule(sk, growth))
++        return -ENOBUFS;
++
++    old_truesize = skb->truesize;
++    atomic64_inc(&pre_gso_dyn_stat_expand_calls);
++    ret = pskb_expand_head(skb, 0, (int)growth, sk->sk_allocation);
++    if (ret) {
++        atomic64_inc(&pre_gso_dyn_stat_expand_fail);
++        return ret;
++    }
++
++    /* pskb_expand_head() has already mutated skb on success: never
++     * return before reconciling its new accounting. TCP staging is
++     * linear and normal expansion must not shrink true size.
++     */
++    if (WARN_ON_ONCE(skb->truesize < old_truesize))
++        return -EIO;
++    if (skb->truesize != old_truesize) {
++        sk_wmem_queued_add(sk, skb->truesize - old_truesize);
++        sk_mem_charge(sk, skb->truesize - old_truesize);
++    }
++    return (size_t)skb_availroom(skb) >= needed ? 0 : -ENOBUFS;
++}
++
++/* Each eligible application sendmsg() invocation counts as ONE logical
++ * message, independently of its byte length or skb allocation capacity.
++ * Successful return is the original byte count accepted into kernel memory;
++ * no change to TCP's existing recv() byte-stream semantics is claimed.
++ */
++static ssize_t tcp_pre_gso_append_locked(struct sock *sk,
++                                         struct msghdr *msg, size_t size,
++                                         long *timeo, int size_goal)
++{
++    struct tcp_sock *tp = tcp_sk(sk);
++    struct sk_buff *skb;
++    size_t max_batch = tcp_pre_gso_batch_limit(sk);
++    size_t initial_bytes;
++    bool first_byte;
++    u32 timeout_us;
++    int err;
++
++    (void)size_goal;
++    if (WARN_ON_ONCE(!size || size > max_batch))
++        return -EMSGSIZE;
++
++retry:
++    if (sk->sk_err || (sk->sk_shutdown & SEND_SHUTDOWN))
++        return -EPIPE;
++    if (sk->sk_state != TCP_ESTABLISHED && sk->sk_state != TCP_CLOSE_WAIT)
++        return -EPIPE;
++
++    skb = tp->pre_gso_skb;
++    if (skb && READ_ONCE(tp->pre_gso_deadline_ns) &&
++        ktime_get_ns() >= READ_ONCE(tp->pre_gso_deadline_ns)) {
++        atomic64_inc(&pre_gso_dyn_stat_timer);
++        tcp_pre_gso_commit_locked(sk);
++        skb = NULL;
++    }
++    if (skb && skb->len + size > max_batch) {
++        /* Safety boundary: unavoidable early Commit, not an N-trigger. */
++        atomic64_inc(&pre_gso_dyn_stat_size);
++        tcp_pre_gso_commit_locked(sk);
++        skb = NULL;
++    }
++    if (!skb) {
++        if (!sk_stream_memory_free(sk))
++            goto wait_for_space;
++        /* Predict a useful initial size from the N target and the actual
++         * first write; avoid repeated reallocations for fixed-size streams.
++         * Any later larger writes can still grow the staging buffer.
++         */
++        {
++            size_t n = max_t(u32, 1, READ_ONCE(
++                sock_net(sk)->ipv4.sysctl_tcp_pre_gso_n));
++
++            initial_bytes = min_t(size_t, max_batch,
++                 size * min_t(size_t, n, max_batch / size));
++            initial_bytes = max_t(size_t, initial_bytes,
++                 min_t(size_t, TCP_PRE_GSO_INITIAL_BYTES, max_batch));
++        }
++        skb = sk_stream_alloc_skb(sk, initial_bytes, sk->sk_allocation,
++                                  false);
++        if (!skb)
++            goto wait_for_space;
++        skb->ip_summed = CHECKSUM_PARTIAL;
++        skb_shinfo(skb)->gso_size = 0;
++        tp->pre_gso_skb = skb;
++        sk_wmem_queued_add(sk, skb->truesize);
++        sk_mem_charge(sk, skb->truesize);
++    }
++
++    first_byte = !skb->len;
++    err = tcp_pre_gso_grow_staging(sk, skb, size, max_batch);
++    if (err) {
++        if (skb->len) {
++            atomic64_inc(&pre_gso_dyn_stat_grow_fail_commit);
++            tcp_pre_gso_commit_locked(sk);
++        } else {
++            tcp_pre_gso_discard_locked(sk);
++        }
++        if (err == -ENOBUFS || err == -ENOMEM)
++            goto wait_for_space;
++        return err;
++    }
++    err = skb_add_data_nocache(sk, skb, &msg->msg_iter, size);
++    if (err) {
++        if (!skb->len)
++            tcp_pre_gso_discard_locked(sk);
++        return err;
++    }
++    atomic64_add(size, &pre_gso_dyn_stat_accepted);
++    WRITE_ONCE(tp->pre_gso_bytes, skb->len);
++    if (first_byte) {
++        timeout_us = READ_ONCE(sock_net(sk)->ipv4.sysctl_tcp_pre_gso_timeout_us);
++        tp->pre_gso_target_n = max_t(u32, 1,
++            READ_ONCE(sock_net(sk)->ipv4.sysctl_tcp_pre_gso_n));
++        if (timeout_us) {
++            u64 deadline = ktime_get_ns() + (u64)timeout_us * NSEC_PER_USEC;
++
++            WRITE_ONCE(tp->pre_gso_deadline_ns, deadline);
++            sock_hold(sk);
++            hrtimer_start(&tp->pre_gso_timer, ns_to_ktime(deadline),
++                          HRTIMER_MODE_ABS_PINNED_SOFT);
++        }
++    }
++    tp->pre_gso_msgs++;
++    if (tp->pre_gso_msgs >= tp->pre_gso_target_n) {
++        atomic64_inc(&pre_gso_dyn_stat_n);
++        tcp_pre_gso_commit_locked(sk);
++    }
++    return size;
++
++wait_for_space:
++    if (sk->sk_socket)
++        set_bit(SOCK_NOSPACE, &sk->sk_socket->flags);
++    err = sk_stream_wait_memory(sk, timeo);
++    if (!err)
++        goto retry;
++    return err;
++}
++
++/*
++ * The callback follows the existing TCP write-timer pattern: it never
++ * races a user-owned socket. A deferred callback gets its own socket ref.
++ */
++void tcp_pre_gso_timer_handler(struct sock *sk)
++{
++    struct tcp_sock *tp = tcp_sk(sk);
++    u64 deadline = READ_ONCE(tp->pre_gso_deadline_ns);
++
++    /* A peer RST / hard timeout may have closed the socket while the
++     * hrtimer callback was deferred behind a user-owned socket.
++     * Do not enqueue formerly accepted bytes into a closed TCP flow.
++     */
++    if (tp->pre_gso_skb && (sk->sk_state == TCP_CLOSE || sk->sk_err ||
++                            (sk->sk_shutdown & SEND_SHUTDOWN))) {
++        tcp_pre_gso_discard_locked(sk);
++        return;
++    }
++    if (tp->pre_gso_skb && deadline && ktime_get_ns() >= deadline) {
++        atomic64_inc(&pre_gso_dyn_stat_timer);
++        tcp_pre_gso_commit_locked(sk);
++    }
++}
++
++static enum hrtimer_restart tcp_pre_gso_timer_callback(struct hrtimer *timer)
++{
++    struct tcp_sock *tp = container_of(timer, struct tcp_sock, pre_gso_timer);
++    struct sock *sk = (struct sock *)tp;
++
++    bh_lock_sock(sk);
++    if (!sock_owned_by_user(sk)) {
++        tcp_pre_gso_timer_handler(sk);
++    } else if (!test_and_set_bit(TCP_PRE_GSO_TIMER_DEFERRED,
++                                 &sk->sk_tsq_flags)) {
++        sock_hold(sk);
++    }
++    bh_unlock_sock(sk);
++    sock_put(sk); /* the reference taken when this timer was armed */
++    return HRTIMER_NORESTART;
++}
++
+ int tcp_sendmsg_locked(struct sock *sk, struct msghdr *msg, size_t size)
+ {
+ 	struct tcp_sock *tp = tcp_sk(sk);
+@@ -1213,6 +1660,13 @@ int tcp_sendmsg_locked(struct sock *sk, struct msghdr *msg, size_t size)
+ 
+ 	flags = msg->msg_flags;
+ 
++	/* Older accepted bytes must precede exceptional send paths. */
++	if (tp->pre_gso_skb &&
++	    ((flags & ~(MSG_DONTWAIT | MSG_NOSIGNAL)) ||
++	     tp->repair || inet_sk(sk)->defer_connect ||
++	     (tp->nonagle & TCP_NAGLE_CORK) || inet_csk_has_ulp(sk)))
++		tcp_pre_gso_commit_locked(sk);
++
+ 	if (flags & MSG_ZEROCOPY && size && sock_flag(sk, SOCK_ZEROCOPY)) {
+ 		skb = tcp_write_queue_tail(sk);
+ 		uarg = msg_zerocopy_realloc(sk, size, skb_zcopy(skb));
+@@ -1285,6 +1739,20 @@ int tcp_sendmsg_locked(struct sock *sk, struct msghdr *msg, size_t size)
+ 	if (sk->sk_err || (sk->sk_shutdown & SEND_SHUTDOWN))
+ 		goto do_error;
+ 
++	if (msg_data_left(msg) == size &&
++	    tcp_pre_gso_eligible(sk, msg, size, sockc.tsflags, size_goal)) {
++		ssize_t accepted = tcp_pre_gso_append_locked(
++			sk, msg, size, &timeo, size_goal);
++
++		if (accepted >= 0)
++			return accepted;
++		err = accepted;
++		goto out_err;
++	}
++	/* Settings can change while a batch is pending. */
++	if (tp->pre_gso_skb)
++		tcp_pre_gso_commit_locked(sk);
++
+ 	while (msg_data_left(msg)) {
+ 		int copy = 0;
+ 
+@@ -2687,7 +3155,8 @@ void tcp_shutdown(struct sock *sk, int how)
+ 	if ((1 << sk->sk_state) &
+ 	    (TCPF_ESTABLISHED | TCPF_SYN_SENT |
+ 	     TCPF_SYN_RECV | TCPF_CLOSE_WAIT)) {
+-		/* Clear out any half completed packets.  FIN if needed. */
++		/* Flush accepted Pre-GSO bytes before allocating FIN sequence. */
++		tcp_pre_gso_commit_locked(sk);
+ 		if (tcp_close_state(sk))
+ 			tcp_send_fin(sk);
+ 	}
+@@ -2767,8 +3236,10 @@ void __tcp_close(struct sock *sk, long timeout)
+ 	sk_mem_reclaim(sk);
+ 
+ 	/* If socket has been already reset (e.g. in tcp_reset()) - kill it. */
+-	if (sk->sk_state == TCP_CLOSE)
++	if (sk->sk_state == TCP_CLOSE) {
++		tcp_pre_gso_discard_locked(sk);
+ 		goto adjudge_to_death;
++	}
+ 
+ 	/* As outlined in RFC 2525, section 2.17, we send a RST here because
+ 	 * data was lost. To witness the awful effects of the old behavior of
+@@ -2778,17 +3249,23 @@ void __tcp_close(struct sock *sk, long timeout)
+ 	 * Note: timeout is always zero in such a case.
+ 	 */
+ 	if (unlikely(tcp_sk(sk)->repair)) {
++		tcp_pre_gso_discard_locked(sk);
+ 		sk->sk_prot->disconnect(sk, 0);
+ 	} else if (data_was_unread) {
++		tcp_pre_gso_discard_locked(sk);
+ 		/* Unread data was tossed, zap the connection. */
+ 		NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPABORTONCLOSE);
+ 		tcp_set_state(sk, TCP_CLOSE);
+ 		tcp_send_active_reset(sk, sk->sk_allocation);
+ 	} else if (sock_flag(sk, SOCK_LINGER) && !sk->sk_lingertime) {
++		tcp_pre_gso_discard_locked(sk);
+ 		/* Check zero linger _after_ checking for unread data. */
+ 		sk->sk_prot->disconnect(sk, 0);
+ 		NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPABORTONDATA);
+-	} else if (tcp_close_state(sk)) {
++	} else {
++		tcp_pre_gso_commit_locked(sk);
++		if (tcp_close_state(sk))
++			tcp_send_fin(sk);
+ 		/* We FIN if the application ate all the data before
+ 		 * zapping the connection.
+ 		 */
+@@ -2818,7 +3295,6 @@ void __tcp_close(struct sock *sk, long timeout)
+ 		 * probably need API support or TCP_CORK SYN-ACK until
+ 		 * data is written and socket is closed.)
+ 		 */
+-		tcp_send_fin(sk);
+ 	}
+ 
+ 	sk_stream_wait_close(sk, timeout);
+@@ -2944,6 +3420,8 @@ void tcp_write_queue_purge(struct sock *sk)
+ {
+ 	struct sk_buff *skb;
+ 
++	tcp_pre_gso_discard_locked(sk);
++
+ 	tcp_chrono_stop(sk, TCP_CHRONO_BUSY);
+ 	while ((skb = __skb_dequeue(&sk->sk_write_queue)) != NULL) {
+ 		tcp_skb_tsorted_anchor_cleanup(skb);
+@@ -2970,6 +3448,8 @@ int tcp_disconnect(struct sock *sk, int flags)
+ 	int old_state = sk->sk_state;
+ 	u32 seq;
+ 
++	/* Connection is being abandoned; do not carry pending bytes forward. */
++	tcp_pre_gso_discard_locked(sk);
+ 	if (old_state != TCP_CLOSE)
+ 		tcp_set_state(sk, TCP_CLOSE);
+ 
+@@ -4439,6 +4919,16 @@ void tcp_done(struct sock *sk)
+ {
+ 	struct request_sock *req;
+ 
++	/* tcp_done() is reached from several hard-error and timeout paths
++	 * without tcp_write_queue_purge(). A staged skb is not on that
++	 * queue, so finalize it here before state changes or destruction.
++	 * Only TCP sockets with a pending skb are touched; this is safe for
++	 * newly allocated sockets whose timer has not been initialized.
++	 * All paths reaching here must serialize with the TCP socket lock.
++	 */
++	if (tcp_sk(sk)->pre_gso_skb)
++		tcp_pre_gso_discard_locked(sk);
++
+ 	/* We might be called with a new socket, after
+ 	 * inet_csk_prepare_forced_close() has been called
+ 	 * so we can not use lockdep_sock_is_held(sk)
+@@ -4500,6 +4990,7 @@ int tcp_abort(struct sock *sk, int err)
+ 
+ 	bh_unlock_sock(sk);
+ 	local_bh_enable();
++	tcp_pre_gso_discard_locked(sk);
+ 	tcp_write_queue_purge(sk);
+ 	release_sock(sk);
+ 	return 0;
+diff --git a/net/ipv4/tcp_ipv4.c b/net/ipv4/tcp_ipv4.c
+index 0e1fbad17dbe..27cf22370650 100644
+--- a/net/ipv4/tcp_ipv4.c
++++ b/net/ipv4/tcp_ipv4.c
+@@ -2278,6 +2278,8 @@ void tcp_v4_destroy_sock(struct sock *sk)
+ 
+ 	trace_tcp_destroy_sock(sk);
+ 
++	/* Defensive cleanup for any skb not transferred to TCP. */
++	tcp_pre_gso_discard_locked(sk);
+ 	tcp_clear_xmit_timers(sk);
+ 
+ 	tcp_cleanup_congestion_control(sk);
+@@ -3065,8 +3067,10 @@ void tcp4_proc_exit(void)
+ bool tcp_stream_memory_free(const struct sock *sk, int wake)
+ {
+ 	const struct tcp_sock *tp = tcp_sk(sk);
+-	u32 notsent_bytes = READ_ONCE(tp->write_seq) -
+-			    READ_ONCE(tp->snd_nxt);
++	u64 notsent_bytes = (u32)(READ_ONCE(tp->write_seq) -
++			    READ_ONCE(tp->snd_nxt));
++
++	notsent_bytes += READ_ONCE(tp->pre_gso_bytes);
+ 
+ 	return (notsent_bytes << wake) < tcp_notsent_lowat(tp);
+ }
+@@ -3153,6 +3157,9 @@ static int __net_init tcp_sk_init(struct net *net)
+ 	net->ipv4.sysctl_tcp_orphan_retries = 0;
+ 	net->ipv4.sysctl_tcp_fin_timeout = TCP_FIN_TIMEOUT;
+ 	net->ipv4.sysctl_tcp_notsent_lowat = UINT_MAX;
++	net->ipv4.sysctl_tcp_pre_gso_enabled = 0;
++	net->ipv4.sysctl_tcp_pre_gso_n = 4;
++	net->ipv4.sysctl_tcp_pre_gso_timeout_us = 0;
+ 	net->ipv4.sysctl_tcp_tw_reuse = 2;
+ 	net->ipv4.sysctl_tcp_no_ssthresh_metrics_save = 1;
+ 
+diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
+index 33ba1268a111..960a5424c325 100644
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@ -1066,7 +1066,8 @@ static void tcp_tasklet_func(struct tasklet_struct *t)
+ #define TCP_DEFERRED_ALL (TCPF_TSQ_DEFERRED |		\
+ 			  TCPF_WRITE_TIMER_DEFERRED |	\
+ 			  TCPF_DELACK_TIMER_DEFERRED |	\
+-			  TCPF_MTU_REDUCED_DEFERRED)
++			  TCPF_MTU_REDUCED_DEFERRED | \
++			  TCPF_PRE_GSO_TIMER_DEFERRED)
+ /**
+  * tcp_release_cb - tcp release_sock() callback
+  * @sk: socket
+@@ -1109,6 +1110,10 @@ void tcp_release_cb(struct sock *sk)
+ 		tcp_delack_timer_handler(sk);
+ 		__sock_put(sk);
+ 	}
++	if (flags & TCPF_PRE_GSO_TIMER_DEFERRED) {
++		tcp_pre_gso_timer_handler(sk);
++		__sock_put(sk);
++	}
+ 	if (flags & TCPF_MTU_REDUCED_DEFERRED) {
+ 		inet_csk(sk)->icsk_af_ops->mtu_reduced(sk);
+ 		__sock_put(sk);
+diff --git a/net/ipv4/tcp_timer.c b/net/ipv4/tcp_timer.c
+index 50bba370486e..1a16a0cf83b1 100644
+--- a/net/ipv4/tcp_timer.c
++++ b/net/ipv4/tcp_timer.c
+@@ -792,6 +792,7 @@ void tcp_init_xmit_timers(struct sock *sk)
+ {
+ 	inet_csk_init_xmit_timers(sk, &tcp_write_timer, &tcp_delack_timer,
+ 				  &tcp_keepalive_timer);
++	tcp_pre_gso_init_sock_state(sk);
+ 	hrtimer_init(&tcp_sk(sk)->pacing_timer, CLOCK_MONOTONIC,
+ 		     HRTIMER_MODE_ABS_PINNED_SOFT);
+ 	tcp_sk(sk)->pacing_timer.function = tcp_pace_kick;
+-- 
+2.34.1
+

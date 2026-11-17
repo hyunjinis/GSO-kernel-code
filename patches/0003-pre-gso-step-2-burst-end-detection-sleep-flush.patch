@@ -1,0 +1,506 @@
+From 31fb69ddca6fc085d085ce162b27fd7d591ed578 Mon Sep 17 00:00:00 2001
+From: oslab2 <oslab2@oslab2>
+Date: Tue, 17 Nov 2026 09:44:44 +0000
+Subject: [PATCH 3/5] pre-gso: step 2 - burst-end detection (sleep flush)
+
+Implements the paper aggregation_end "conclusion of a message burst"
+without application changes. Previously (reference design) the app
+signalled burst end with MSG_FINISH_SEND; now the kernel infers it:
+a burst is over when the sending task voluntarily blocks.
+
+- Per-task plug (include/net/tcp_pre_gso.h), modelled on the block
+  layer plug: a task that stages Pre-GSO bytes records the socket
+  (with a reference) in current->pre_gso_plug. Only the owning task
+  adds/removes entries, so no lock is needed.
+- sched_submit_work() flushes the plug when the task blocks. Involuntary
+  preemption (softirq/ksoftirqd contention) does not reach this path,
+  so aggregation is kept exactly where Pre-GSO targets.
+- Flush runs without sleeping: bh_lock_sock + commit, or, if the socket
+  is owned by a user context, TCP_PRE_GSO_FLUSH_DEFERRED handled in
+  tcp_release_cb().
+- fork() clears the inherited pointer; do_exit() flushes and frees the
+  plug (the final schedule of a dying task skips sched_submit_work).
+- If the plug cannot grow, the batch is committed immediately
+  (commit_plug_overflow) so a batch can never stall.
+- Timer and sleep paths share tcp_pre_gso_pending_committable(), which
+  keeps the step-1 write-queue invariant.
+- debugfs: commit_sleep and commit_plug_overflow counters.
+- No new sysctl: sleep flush is part of aggregation_end and is always
+  active when Pre-GSO is enabled. timeout_us keeps its meaning.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/linux/sched.h     |   6 ++
+ include/linux/tcp.h       |   6 ++
+ include/net/tcp.h         |   1 +
+ include/net/tcp_pre_gso.h |  50 +++++++++++
+ kernel/exit.c             |   3 +
+ kernel/fork.c             |   4 +
+ kernel/sched/core.c       |  12 +++
+ net/ipv4/tcp.c            | 183 +++++++++++++++++++++++++++++++++-----
+ net/ipv4/tcp_output.c     |   7 +-
+ 9 files changed, 249 insertions(+), 23 deletions(-)
+ create mode 100644 include/net/tcp_pre_gso.h
+
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index e418935f8db6..4cff05db8667 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -41,6 +41,7 @@ struct audit_context;
+ struct backing_dev_info;
+ struct bio_list;
+ struct blk_plug;
++struct tcp_pre_gso_plug;
+ struct bpf_local_storage;
+ struct bpf_run_ctx;
+ struct capture_control;
+@@ -1165,6 +1166,11 @@ struct task_struct {
+ 	struct blk_plug			*plug;
+ #endif
+ 
++#ifdef CONFIG_INET
++	/* Pre-GSO sleep-flush plug, see include/net/tcp_pre_gso.h */
++	struct tcp_pre_gso_plug		*pre_gso_plug;
++#endif
++
+ 	/* VM state: */
+ 	struct reclaim_state		*reclaim_state;
+ 
+diff --git a/include/linux/tcp.h b/include/linux/tcp.h
+index f7ebf44f56e4..6a4efabf4e7d 100644
+--- a/include/linux/tcp.h
++++ b/include/linux/tcp.h
+@@ -421,6 +421,10 @@ struct tcp_sock {
+ 	u32 pre_gso_target_n;
+ 	u64 pre_gso_deadline_ns;
+ 	struct hrtimer pre_gso_timer;
++	/* Last task that registered this socket in its sleep-flush plug.
++	 * Used only to avoid duplicate entries; cleared with cmpxchg.
++	 */
++	struct task_struct *pre_gso_plug_owner;
+ };
+ 
+ enum tsq_enum {
+@@ -433,6 +437,7 @@ enum tsq_enum {
+ 	TCP_MTU_REDUCED_DEFERRED,  /* tcp_v{4|6}_err() could not call
+ 				    * tcp_v{4|6}_mtu_reduced()
+ 				    */
++	TCP_PRE_GSO_FLUSH_DEFERRED, /* Pre-GSO sleep flush found socket owned */
+ };
+ 
+ enum tsq_flags {
+@@ -443,6 +448,7 @@ enum tsq_flags {
+ 	TCPF_DELACK_TIMER_DEFERRED	= (1UL << TCP_DELACK_TIMER_DEFERRED),
+ 	TCPF_MTU_REDUCED_DEFERRED	= (1UL << TCP_MTU_REDUCED_DEFERRED),
+ 	TCPF_PRE_GSO_TIMER_DEFERRED = (1UL << TCP_PRE_GSO_TIMER_DEFERRED),
++	TCPF_PRE_GSO_FLUSH_DEFERRED = (1UL << TCP_PRE_GSO_FLUSH_DEFERRED),
+ };
+ 
+ static inline struct tcp_sock *tcp_sk(const struct sock *sk)
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index ed24a3d966d1..abc43a724cbc 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -309,6 +309,7 @@ int tcp_v4_err(struct sk_buff *skb, u32);
+ void tcp_shutdown(struct sock *sk, int how);
+ void tcp_pre_gso_discard_locked(struct sock *sk);
+ void tcp_pre_gso_timer_handler(struct sock *sk);
++void tcp_pre_gso_flush_handler(struct sock *sk);
+ void tcp_pre_gso_init_sock_state(struct sock *sk);
+ 
+ int tcp_v4_early_demux(struct sk_buff *skb);
+diff --git a/include/net/tcp_pre_gso.h b/include/net/tcp_pre_gso.h
+new file mode 100644
+index 000000000000..722a14841cab
+--- /dev/null
++++ b/include/net/tcp_pre_gso.h
+@@ -0,0 +1,50 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Pre-GSO burst-end detection ("sleep flush").
++ *
++ * The paper defines aggregation_end as firing at the conclusion of a
++ * message burst or when the time window expires.  Without application
++ * changes the kernel cannot be told that a burst ended, so it infers it:
++ * a burst is over when the sending task voluntarily blocks (epoll_wait,
++ * recv, futex, sndbuf wait, ...).  Involuntary preemption -- e.g. by
++ * softirq / ksoftirqd on a contended core -- is NOT a burst end, so
++ * aggregation is preserved exactly where Pre-GSO is meant to help.
++ *
++ * Mechanism mirrors the block layer plug: each task that stages Pre-GSO
++ * bytes records the socket in a private per-task list, and the scheduler
++ * flushes that list from sched_submit_work() when the task goes to sleep.
++ * Only the owning task adds or removes entries, so the list needs no lock.
++ */
++#ifndef _NET_TCP_PRE_GSO_H
++#define _NET_TCP_PRE_GSO_H
++
++#include <linux/sched.h>
++
++struct sock;
++
++struct tcp_pre_gso_plug {
++	unsigned int	nr;
++	unsigned int	cap;
++	struct sock	*sk[];	/* each entry holds a socket reference */
++};
++
++#ifdef CONFIG_INET
++void tcp_pre_gso_flush_plug(struct task_struct *tsk);
++void tcp_pre_gso_plug_exit(struct task_struct *tsk);
++
++static inline bool tcp_pre_gso_needs_flush_plug(struct task_struct *tsk)
++{
++	struct tcp_pre_gso_plug *plug = tsk->pre_gso_plug;
++
++	return plug && plug->nr;
++}
++#else
++static inline void tcp_pre_gso_flush_plug(struct task_struct *tsk) { }
++static inline void tcp_pre_gso_plug_exit(struct task_struct *tsk) { }
++static inline bool tcp_pre_gso_needs_flush_plug(struct task_struct *tsk)
++{
++	return false;
++}
++#endif
++
++#endif /* _NET_TCP_PRE_GSO_H */
+diff --git a/kernel/exit.c b/kernel/exit.c
+index 80efdfda6662..7624ba18c8f2 100644
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@ -67,6 +67,7 @@
+ #include <linux/sysfs.h>
+ 
+ #include <linux/uaccess.h>
++#include <net/tcp_pre_gso.h>
+ #include <asm/unistd.h>
+ #include <asm/mmu_context.h>
+ 
+@@ -870,6 +871,8 @@ void __noreturn do_exit(long code)
+ 		disassociate_ctty(1);
+ 	exit_task_namespaces(tsk);
+ 	exit_task_work(tsk);
++	/* The final schedule() of a dying task bypasses sched_submit_work(). */
++	tcp_pre_gso_plug_exit(tsk);
+ 	exit_thread(tsk);
+ 
+ 	/*
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 3fb7e9e6a7b9..2fc74d6a1bcc 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -2247,6 +2247,10 @@ static __latent_entropy struct task_struct *copy_process(
+ 
+ #ifdef CONFIG_BLOCK
+ 	p->plug = NULL;
++#endif
++#ifdef CONFIG_INET
++	/* dup_task_struct() copied the parent's pointer: never share it. */
++	p->pre_gso_plug = NULL;
+ #endif
+ 	futex_init_task(p);
+ 
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index c1458fa8beb3..0bd7e65a5af9 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -16,6 +16,7 @@
+ 
+ #include <linux/kcov.h>
+ #include <linux/scs.h>
++#include <net/tcp_pre_gso.h>
+ 
+ #include <asm/switch_to.h>
+ #include <asm/tlb.h>
+@@ -6430,6 +6431,17 @@ static inline void sched_submit_work(struct task_struct *tsk)
+ 	 */
+ 	if (blk_needs_flush_plug(tsk))
+ 		blk_schedule_flush_plug(tsk);
++
++	/*
++	 * Pre-GSO: a task that blocks has finished its message burst, so
++	 * commit the TCP batches it staged (aggregation_end).  Involuntary
++	 * preemption never gets here, so contention does not end a batch.
++	 * Like the block plug above, never do this while blocking on an
++	 * RT spinlock/rwlock substitute.
++	 */
++	if (tcp_pre_gso_needs_flush_plug(tsk) &&
++	    !(tsk->__state & TASK_RTLOCK_WAIT))
++		tcp_pre_gso_flush_plug(tsk);
+ }
+ 
+ static void sched_update_worker(struct task_struct *tsk)
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+index 546de2a2214c..9356cadc3fc2 100644
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -247,6 +247,7 @@
+ #include <linux/debugfs.h>
+ #include <linux/seq_file.h>
+ #include <linux/atomic.h>
++#include <net/tcp_pre_gso.h>
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/types.h>
+@@ -430,6 +431,11 @@ void tcp_pre_gso_init_sock_state(struct sock *sk)
+ 	tp->pre_gso_bypass = false;
+ 	WRITE_ONCE(tp->pre_gso_bytes, 0);
+ 	WRITE_ONCE(tp->pre_gso_deadline_ns, 0);
++	/* A child cloned from a reused listener must not inherit a stale
++	 * owner: plug_add would then skip registering the child and its
++	 * batch would never be flushed at burst end.
++	 */
++	WRITE_ONCE(tp->pre_gso_plug_owner, NULL);
+ 	hrtimer_init(&tp->pre_gso_timer, CLOCK_MONOTONIC,
+ 	             HRTIMER_MODE_ABS_PINNED_SOFT);
+ 	tp->pre_gso_timer.function = tcp_pre_gso_timer_callback;
+@@ -1272,6 +1278,10 @@ static atomic64_t pre_gso_dyn_stat_n = ATOMIC64_INIT(0);
+ static atomic64_t pre_gso_dyn_stat_timer = ATOMIC64_INIT(0);
+ static atomic64_t pre_gso_dyn_stat_size = ATOMIC64_INIT(0);
+ static atomic64_t pre_gso_dyn_stat_grow_fail_commit = ATOMIC64_INIT(0);
++/* Burst end inferred from the sending task blocking (sleep flush). */
++static atomic64_t pre_gso_dyn_stat_sleep = ATOMIC64_INIT(0);
++/* Per-task plug could not grow: batch committed at once (no stall). */
++static atomic64_t pre_gso_dyn_stat_plug_overflow = ATOMIC64_INIT(0);
+ static atomic64_t pre_gso_dyn_stat_bytes = ATOMIC64_INIT(0);
+ static atomic64_t pre_gso_dyn_stat_messages = ATOMIC64_INIT(0);
+ static atomic64_t pre_gso_dyn_stat_accepted = ATOMIC64_INIT(0);
+@@ -1291,15 +1301,21 @@ static int tcp_pre_gso_dynamic_stats_show(struct seq_file *m, void *unused)
+     u64 timer = atomic64_read(&pre_gso_dyn_stat_timer);
+     u64 size = atomic64_read(&pre_gso_dyn_stat_size);
+     u64 grow_fail = atomic64_read(&pre_gso_dyn_stat_grow_fail_commit);
++    u64 sleep = atomic64_read(&pre_gso_dyn_stat_sleep);
++    u64 overflow = atomic64_read(&pre_gso_dyn_stat_plug_overflow);
+ 
+     seq_printf(m, "commits %llu\n", (unsigned long long)commits);
+     seq_printf(m, "commit_n %llu\n", (unsigned long long)n);
+     seq_printf(m, "commit_timer %llu\n", (unsigned long long)timer);
++    seq_printf(m, "commit_sleep %llu\n", (unsigned long long)sleep);
+     seq_printf(m, "commit_size_limit %llu\n", (unsigned long long)size);
+     seq_printf(m, "commit_grow_fail %llu\n", (unsigned long long)grow_fail);
++    seq_printf(m, "commit_plug_overflow %llu\n",
++        (unsigned long long)overflow);
+     seq_printf(m, "commit_other_approx %lld\n",
+         (long long)commits-(long long)n-(long long)timer-
+-        (long long)size-(long long)grow_fail);
++        (long long)sleep-(long long)size-(long long)grow_fail-
++        (long long)overflow);
+     seq_printf(m, "committed_bytes %llu\n",
+         (unsigned long long)atomic64_read(&pre_gso_dyn_stat_bytes));
+     seq_printf(m, "committed_messages %llu\n",
+@@ -1507,6 +1523,143 @@ static int tcp_pre_gso_grow_staging(struct sock *sk,
+  * Successful return is the original byte count accepted into kernel memory;
+  * no change to TCP's existing recv() byte-stream semantics is claimed.
+  */
++/*
++ * Shared by every deferred committer (timer, sleep flush).  Returns true
++ * when a staged batch exists and may be committed.  Called under the TCP
++ * socket lock (bh_lock_sock with !owned, or from tcp_release_cb).
++ */
++static bool tcp_pre_gso_pending_committable(struct sock *sk)
++{
++    struct tcp_sock *tp = tcp_sk(sk);
++
++    if (!tp->pre_gso_skb)
++        return false;
++
++    /* Invariant: staged bytes share the fate of TCP write-queue bytes.
++     * TCP drops its write queue only when the connection is torn down
++     * (tcp_done / tcp_write_queue_purge / tcp_disconnect), never because
++     * sk_err is set on a still-usable connection.  Discarding here on
++     * sk_err alone would drop bytes already reported as sent while later
++     * bytes still go out, i.e. a silent hole in the byte stream.
++     */
++    if (sk->sk_state == TCP_CLOSE) {
++        tcp_pre_gso_discard_locked(sk);
++        return false;
++    }
++    /* tcp_shutdown() commits before the FIN is queued, so staged bytes
++     * can never coexist with SEND_SHUTDOWN.  If they do, appending them
++     * after the FIN sequence would corrupt the stream: drop and report.
++     */
++    if (WARN_ON_ONCE(sk->sk_shutdown & SEND_SHUTDOWN)) {
++        tcp_pre_gso_discard_locked(sk);
++        return false;
++    }
++    return true;
++}
++
++/* aggregation_end: the task that staged this batch went to sleep. */
++void tcp_pre_gso_flush_handler(struct sock *sk)
++{
++    if (!tcp_pre_gso_pending_committable(sk))
++        return;
++    atomic64_inc(&pre_gso_dyn_stat_sleep);
++    tcp_pre_gso_commit_locked(sk);
++}
++
++#define TCP_PRE_GSO_PLUG_INIT	8U
++#define TCP_PRE_GSO_PLUG_MAX	4096U
++
++/*
++ * Record @sk in current's plug so that the batch is committed when
++ * current blocks.  Process context, under lock_sock(sk).  Only current
++ * touches current->pre_gso_plug, so no lock is needed; a sleep inside
++ * krealloc() may run tcp_pre_gso_flush_plug() on the old buffer before it
++ * is copied, which is consistent because the copy happens afterwards.
++ * Returns false if the entry could not be recorded.
++ */
++static bool tcp_pre_gso_plug_add(struct sock *sk)
++{
++    struct tcp_sock *tp = tcp_sk(sk);
++    struct task_struct *tsk = current;
++    struct tcp_pre_gso_plug *plug;
++
++    if (READ_ONCE(tp->pre_gso_plug_owner) == tsk)
++        return true;
++
++    plug = tsk->pre_gso_plug;
++    if (!plug || plug->nr == plug->cap) {
++        unsigned int cap = plug ? plug->cap * 2 : TCP_PRE_GSO_PLUG_INIT;
++        struct tcp_pre_gso_plug *np;
++
++        if (cap > TCP_PRE_GSO_PLUG_MAX)
++            return false;
++        np = krealloc(plug, struct_size(np, sk, cap),
++                      GFP_KERNEL | __GFP_NOWARN);
++        if (!np)
++            return false;
++        if (!plug)
++            np->nr = 0;
++        np->cap = cap;
++        tsk->pre_gso_plug = np;
++        plug = np;
++        /* krealloc() may have slept and flushed: re-check the slot. */
++        if (plug->nr == plug->cap)
++            return false;
++    }
++
++    sock_hold(sk);
++    plug->sk[plug->nr++] = sk;
++    WRITE_ONCE(tp->pre_gso_plug_owner, tsk);
++    return true;
++}
++
++/*
++ * Called from sched_submit_work() when @tsk (== current) is about to block
++ * voluntarily.  Must not sleep: uses the same bh_lock_sock / deferred
++ * pattern as the TCP timers, so a socket owned by a user context (possibly
++ * this very task, e.g. a page fault inside sendmsg) is flushed from
++ * tcp_release_cb() instead.
++ */
++void tcp_pre_gso_flush_plug(struct task_struct *tsk)
++{
++    struct tcp_pre_gso_plug *plug = tsk->pre_gso_plug;
++    unsigned int i, nr;
++
++    if (!plug || !plug->nr)
++        return;
++
++    nr = plug->nr;
++    plug->nr = 0;
++    for (i = 0; i < nr; i++) {
++        struct sock *sk = plug->sk[i];
++
++        cmpxchg(&tcp_sk(sk)->pre_gso_plug_owner, tsk, NULL);
++
++        local_bh_disable();
++        bh_lock_sock(sk);
++        if (!sock_owned_by_user(sk))
++            tcp_pre_gso_flush_handler(sk);
++        else if (!test_and_set_bit(TCP_PRE_GSO_FLUSH_DEFERRED,
++                                   &sk->sk_tsq_flags))
++            sock_hold(sk);
++        bh_unlock_sock(sk);
++        local_bh_enable();
++
++        sock_put(sk);   /* reference taken by tcp_pre_gso_plug_add() */
++    }
++}
++
++/* do_exit(): flush what is left and release the plug itself. */
++void tcp_pre_gso_plug_exit(struct task_struct *tsk)
++{
++    struct tcp_pre_gso_plug *plug;
++
++    tcp_pre_gso_flush_plug(tsk);
++    plug = tsk->pre_gso_plug;
++    tsk->pre_gso_plug = NULL;
++    kfree(plug);
++}
++
+ static ssize_t tcp_pre_gso_append_locked(struct sock *sk,
+                                          struct msghdr *msg, size_t size,
+                                          long *timeo, int size_goal)
+@@ -1607,6 +1760,12 @@ static ssize_t tcp_pre_gso_append_locked(struct sock *sk,
+     if (tp->pre_gso_msgs >= tp->pre_gso_target_n) {
+         atomic64_inc(&pre_gso_dyn_stat_n);
+         tcp_pre_gso_commit_locked(sk);
++    } else if (!tcp_pre_gso_plug_add(sk)) {
++        /* Without a plug entry nothing would flush this batch at burst
++         * end; never risk a stall, give up aggregation for it instead.
++         */
++        atomic64_inc(&pre_gso_dyn_stat_plug_overflow);
++        tcp_pre_gso_commit_locked(sk);
+     }
+     return size;
+ 
+@@ -1628,28 +1787,8 @@ void tcp_pre_gso_timer_handler(struct sock *sk)
+     struct tcp_sock *tp = tcp_sk(sk);
+     u64 deadline = READ_ONCE(tp->pre_gso_deadline_ns);
+ 
+-    if (!tp->pre_gso_skb)
++    if (!tcp_pre_gso_pending_committable(sk))
+         return;
+-
+-    /* Invariant: staged bytes share the fate of TCP write-queue bytes.
+-     * TCP drops its write queue only when the connection is torn down
+-     * (tcp_done / tcp_write_queue_purge / tcp_disconnect), never because
+-     * sk_err is set on a still-usable connection.  Discarding here on
+-     * sk_err alone would drop bytes already reported as sent while later
+-     * bytes still go out, i.e. a silent hole in the byte stream.
+-     */
+-    if (sk->sk_state == TCP_CLOSE) {
+-        tcp_pre_gso_discard_locked(sk);
+-        return;
+-    }
+-    /* tcp_shutdown() commits before the FIN is queued, so staged bytes
+-     * can never coexist with SEND_SHUTDOWN.  If they do, appending them
+-     * after the FIN sequence would corrupt the stream: drop and report.
+-     */
+-    if (WARN_ON_ONCE(sk->sk_shutdown & SEND_SHUTDOWN)) {
+-        tcp_pre_gso_discard_locked(sk);
+-        return;
+-    }
+     if (deadline && ktime_get_ns() >= deadline) {
+         atomic64_inc(&pre_gso_dyn_stat_timer);
+         tcp_pre_gso_commit_locked(sk);
+diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
+index 960a5424c325..8f5ad7fb4026 100644
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@ -1067,7 +1067,8 @@ static void tcp_tasklet_func(struct tasklet_struct *t)
+ 			  TCPF_WRITE_TIMER_DEFERRED |	\
+ 			  TCPF_DELACK_TIMER_DEFERRED |	\
+ 			  TCPF_MTU_REDUCED_DEFERRED | \
+-			  TCPF_PRE_GSO_TIMER_DEFERRED)
++			  TCPF_PRE_GSO_TIMER_DEFERRED | \
++			  TCPF_PRE_GSO_FLUSH_DEFERRED)
+ /**
+  * tcp_release_cb - tcp release_sock() callback
+  * @sk: socket
+@@ -1114,6 +1115,10 @@ void tcp_release_cb(struct sock *sk)
+ 		tcp_pre_gso_timer_handler(sk);
+ 		__sock_put(sk);
+ 	}
++	if (flags & TCPF_PRE_GSO_FLUSH_DEFERRED) {
++		tcp_pre_gso_flush_handler(sk);
++		__sock_put(sk);
++	}
+ 	if (flags & TCPF_MTU_REDUCED_DEFERRED) {
+ 		inet_csk(sk)->icsk_af_ops->mtu_reduced(sk);
+ 		__sock_put(sk);
+-- 
+2.34.1
+
